@@ -1,0 +1,7 @@
+[readability]
+enabled = true
+model = "local-e2e/robot-reviewer"
+
+[readability.guidelines.fixture-guideline]
+text = "SYNTHETIC_GUIDELINE_SENTINEL: Explain the business outcome in the test name."
+enabled = true

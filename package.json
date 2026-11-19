@@ -1,0 +1,44 @@
+{
+  "name": "pi-robot-framework-validator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agent-led Robot Framework review for Pi",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "pi-package",
+    "robotframework"
+  ],
+  "files": [
+    "src/"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "csv-parse": "7.0.3",
+    "exceljs": "4.4.0",
+    "smol-toml": "1.9.1",
+    "unzipper": "0.12.5"
+  },
+  "overrides": { "exceljs": { "uuid": "11.1.1" } },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.20.0",
+    "typebox": "1.4.7",
+    "typescript": "^5.9.0"
+  }
+}

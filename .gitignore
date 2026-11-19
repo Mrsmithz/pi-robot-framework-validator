@@ -1,0 +1,5 @@
+node_modules/
+.robocop_cache/
+coverage/
+todo.md
+decisions.tsv
