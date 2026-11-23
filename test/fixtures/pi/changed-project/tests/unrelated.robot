@@ -1,3 +1,3 @@
 *** Test Cases ***
-EX-1 checkout succeeds
+UNRELATED_TEST_SENTINEL
     No Operation

@@ -1,0 +1,3 @@
+ID,Name,Objective
+TC-1,Successful checkout,The customer completes checkout.
+QA_UNRELATED_SENTINEL,Unrelated payment edge,This unrelated case must not leave the local QA folder.

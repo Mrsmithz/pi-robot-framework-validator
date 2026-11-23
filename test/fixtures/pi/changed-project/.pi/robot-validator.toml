@@ -1,0 +1,28 @@
+[robocop]
+command = "robocop"
+config = "robocop.toml"
+
+[readability]
+enabled = true
+model = "local-e2e/robot-reviewer"
+
+[readability.guidelines.business]
+text = "Explain the business outcome in the test name."
+enabled = true
+
+[qa]
+folder = "qa"
+
+[references]
+bitbucket = true
+
+[references.local.customer-api]
+path = "tests/reference.robot"
+category = "api"
+
+[references.snippets.customer-api-pinned]
+workspace = "fixture-workspace"
+snippet = "fixture-snippet"
+revision = "0123456789abcdef0123456789abcdef01234567"
+file = "tests/pinned-reference.robot"
+category = "api"

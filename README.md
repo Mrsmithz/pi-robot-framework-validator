@@ -1,36 +1,54 @@
 # Pi Robot Framework Validator
 
-Review Robot Framework tests in Pi before handing them back. The agent runs your Robocop lint rules, checks test names and objectives against a QA spreadsheet with a reviewer model, and reviews whether someone in the business can follow the tests.
+Review the Robot Framework changes an agent makes before it hands them back in Pi. Robocop checks configured rules. The extension compares QA wording locally and asks a separate reviewer for advisory readability and project reference notes.
 
 ## Install
 
-Use Pi 1.5.2 or later and put your Robocop-compatible CLI on Pi's `PATH`. The CLI must support `robocop check` with an explicit config and the `json_report` report. Install Robocop separately; this package does not install it.
-
-Once this repository contains a published package revision, install it with:
+Use Pi 1.5.2 or later. Install a Robocop-compatible CLI that supports `robocop check` with an explicit config and the `json_report` report. The extension does not install Robocop.
 
 ```sh
 pi install git:github.com/Mrsmithz/pi-robot-framework-validator
 ```
 
-To install for one trusted project instead, run the same command with `--local` from that project. Use one installation scope. To try a checkout before installing, run `npm ci` in the checkout, then start Pi from the Robot project root with `pi -e /path/to/pi-robot-framework-validator/src/index.ts`.
+Run the same command from a trusted project with `--local` to install it only there. Use one installation scope. To test a checkout, run `npm ci` in the checkout. Then start Pi in the Robot project root with `pi -e /path/to/pi-robot-framework-validator/src/index.ts`.
 
-## Review tests
+For the local QA check, install Robot Framework 7.4.2 in the Python environment the extension will use. For example, from the Robot project:
 
-Start Pi at the Robot project root. Ask the agent to review specific `.robot` files, or explicitly ask and confirm a whole-project review. The extension reminds the agent before work starts to review any Robot tests it changes before handoff. There is no slash command or check after every edit.
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install robotframework==7.4.2
+```
 
-For each review, the agent names the model that would receive QA data and asks which local CSV or XLSX file to use. You can limit the selection to a sheet or an A1 range. For example: `qa/cases.xlsx`, sheet `Regression`, range `A4:F45`. Share only data that you are allowed to send to the receiving provider. The agent can choose relevant rows or submit the whole selected workbook. Pi asks you to confirm the file, scope, and recipient before it reads anything. It does not reuse a selection from an earlier review. If you decline or your Pi mode cannot confirm, Robocop and readability can still run and QA is **Uncheckable**.
+In the project settings, set `qa.python` to the absolute path to `.venv/bin/python`. If the default `python3` on Pi's `PATH` already has the tested Robot version, you can leave the setting unset. The extension parses source files without running suites, importing their libraries, or installing Python packages.
 
-The review reports three results separately:
+## Review changes
 
-- **Robocop findings** include the Robot file, line, rule ID, and message. A failed or incompatible Robocop run is **Uncheckable**, not clean.
-- **QA wording notes** compare the selected Robot tests with QA by test case ID. Keep `<ID> <name>` and `[Documentation]` verbatim. The reviewer cites the Robot line and the relevant spreadsheet cell. Sheet numbers start at 1 within the selected sheets. It does not require fixed column names, audit unautomated QA cases, or guarantee exact whitespace matching. If the workbook is too large or the layout or match is ambiguous, provide a smaller range or clarify the relevant fields. Update the QA record first if the QA wording itself needs to change.
-- **Readability notes** cite a Robot line, the issue, and the applicable guideline when there is one. They are advisory. The extension does not run Robot suites or edit tests.
+Start Pi at the Robot project root. Ask the agent to review the Robot changes from the current task, or name the files and lines you want reviewed. The extension reminds the agent to run the check before handoff, not after each edit. It does not scan the working tree or ask for a workbook when there are no changed tests. A resource-only change can get lint and advisory notes without a QA prompt.
 
-If an XLSX selection contains dates, unsupported number formats, or formulas without cached results, select only the QA columns or export them as text to CSV. The extension does not calculate formulas.
+The result separates four checks:
+
+| Check | What to expect |
+| --- | --- |
+| Robocop | Findings with file, line, and rule ID. Existing Robocop config owns all lint rules. |
+| QA wording | Exact results for the parsed test name after the ID and test-level `[Documentation]`. The tool cites Robot and QA locations without returning workbook wording to the agent. |
+| Readability | Advisory notes with Robot locations and the applicable guideline when available. |
+| Reference comparison | Advisory notes citing both the change and comparable, approved examples. No applicable example is **Skipped**, not a match. |
+
+**Uncheckable** means a required check could not finish or a field could not be compared. **Not applicable** means the check had no eligible target. Independent checks continue. Fix any missing input and ask the agent to rerun affected checks before handoff. The extension does not block handoff or edit tests or QA records.
+
+## Set up QA wording checks
+
+1. Set `qa.folder` to a directory inside the trusted project. Put a CSV or XLSX with QA records in that directory. If there is more than one eligible file, choose the source in Pi's picker. Pi does not remember that choice.
+2. Ask the agent to set up a QA mapping. Give it the XLSX sheet if applicable, the header row number, and the column letters for the test case ID, name, and objective. For example, `Regression`, row `3`, ID `A`, name `C`, and objective `F`.
+3. Review the layout in Pi's confirmation dialog. Confirm to save the mapping as `default`, or ask for a different name. Ask for that name when you review a layout other than the default.
+
+Pi saves the layout in `.pi/robot-validator-qa-mappings.json`, not the workbook path or QA rows. When the sheet or mapped headers change, confirm the new layout. For a file without headers, specify the columns and, for XLSX, the sheet for one review without saving. If you ask for an AI mapping suggestion, Pi previews the selected header row and shows the exact model recipient before sending it. Approve only if the row contains column headings, not QA records. An ambiguous suggestion needs a manual mapping. The comparison never sends QA rows to a model.
+
+Use the first word of a Robot test name as the QA ID. IDs are exact text. `00123` and `123` are different. Use the exact QA name and objective in the test name and `[Documentation]`. Only line endings are normalized after parsing. Duplicate IDs, blank QA fields, unavailable workbooks, and unresolved Robot variables can leave a comparison **Uncheckable**. If the XLSX reader cannot interpret a number format or a formula has no cached value, export the needed columns as text to CSV and confirm that layout. The extension does not calculate formulas.
 
 ## Configure
 
-Put global settings in `robot-validator.toml` in Pi's configured agent directory (normally `~/.pi/agent`). Put overrides in `<project>/.pi/robot-validator.toml`. Project overrides and Robocop require Pi project trust because Robocop can load custom rules. If Pi did not ask about project trust at startup, use `/trust` to explicitly trust the project before running Robocop. Remove an override to inherit the lower-priority value. Ask the agent to show Robot validator settings to see effective values, their sources, and the receiving model without running a review.
+Put global settings in `robot-validator.toml` in Pi's agent directory, normally `~/.pi/agent`. Put project settings in `<project>/.pi/robot-validator.toml`. Project settings and all four review checks require Pi project trust. If Pi did not ask, use `/trust` before running checks. Ask the agent to show effective settings, their sources, and the reviewer model without running a review.
 
 Example global settings:
 
@@ -59,21 +77,50 @@ config = "config/robocop.toml"
 [rules."robocop:line-too-long"]
 line_length = 120
 
+[qa]
+folder = "qa"
+# python = "/absolute/path/to/project/.venv/bin/python"
+
 [readability.guidelines.named-verification]
-text = "Group related assertions in a keyword that names the expected outcome."
+text = "Group assertions in a keyword that names the expected outcome."
+
+[references.local.customer-api]
+path = "tests/api/customer.robot"
+category = "api"
 ```
 
-`robocop.command` is one executable name or an absolute path, not a command line. The default is `robocop`. The baseline config defaults to `robocop.toml` at the project root. The extension does not modify that file. Rule overrides use Robocop's `list rules`, `docs`, and TOML `extends`. Overrides and baselines that inherit settings or configure JSON output require a writable baseline directory for a temporary sibling config. Set `enabled = false` to disable a lint rule or a guideline.
+`robocop.command` and `qa.python` are executable names on `PATH` or absolute paths, not command lines. The Robocop baseline defaults to `robocop.toml` at the project root. Rule overrides use Robocop's `list rules`, `docs`, and TOML `extends`. Some overrides or inherited settings require a writable baseline directory for a temporary sibling config. The extension does not change the baseline.
 
-By default, the reviewer uses the current Pi model. Set `readability.model` to an exact `provider/model-id` configured in Pi to use a different reviewer for QA and readability without switching the main model. Each review request receives only its inputs. Readability receives the selected tests, relevant keyword excerpts, and active guidelines. QA receives the selected tests and approved QA cells. Neither receives chat history or tools, and QA results return field and cell references without quoting spreadsheet contents. If the model is unavailable, the review reports that instead of switching models. `readability.enabled = false` disables readability notes only; QA review can still run.
+By default, the advisory reviewer uses Pi's current model. Set `readability.model` to an exact `provider/model-id` to use a different reviewer without switching the main model. The reviewer receives scoped source, relevant keyword excerpts, guidelines, and applicable approved examples. It receives no chat history or tool definitions and never receives QA rows. There is no automatic model fallback. Disable individual rules or guidelines with `enabled = false`. `readability.enabled = false` disables guideline notes without disabling reference comparison.
 
-The built-in guidelines are `business-readable`, `given-when-then`, and `named-verification`. If your custom Robocop already checks `Given`, `When`, and `Then`, you can disable the `given-when-then` guideline to avoid duplicate notes. The extension does not implement its own lint rules.
+The built-in guidelines are `business-readable`, `given-when-then`, and `named-verification`. If Robocop already checks `Given`, `When`, and `Then`, disable the advisory `given-when-then` guideline to avoid duplicate notes.
+
+### Approve reference examples
+
+List each approved local example in the trusted project settings. Assign a category such as `api` or `ui`. The agent compares only files of a comparable category, using real project-relative paths for layout advice. One example can support a suggestion. It cannot establish a project-wide convention on its own.
+
+To opt in to Bitbucket Cloud snippets, configure a pinned example:
+
+```toml
+[references]
+bitbucket = true
+
+[references.snippets.shared-api]
+workspace = "example-workspace"
+snippet = "example-snippet"
+revision = "0123456789abcdef0123456789abcdef01234567"
+file = "example.robot"
+category = "api"
+projectPath = "tests/api/example.robot"
+```
+
+Install and configure your existing `mcp-bitbucket` workflow separately. Approve the exact receiving models in Pi before the agent fetches private code. The agent uses only the configured file at the full Git revision and forwards relevant excerpts with original line numbers. Omit `projectPath` if the original path is unknown. Such an example cannot support layout advice. If MCP cannot establish the pinned revision, Pi skips the reference rather than fetching the latest copy. The extension checks the excerpt's declared identity against its approved list. The main agent must verify provenance through MCP before handing it off. The extension does not control that MCP connection or manage credentials.
 
 ## Verify setup
 
-1. In a trusted Robot project, ask Pi to show the validator settings. Confirm the baseline path, command, and review recipient.
-2. Review a file known to be clean, a file with a known Robocop violation, and a run with an invalid Robocop config path. Confirm the results distinguish no findings, findings, and **Uncheckable**. Try a project limit override and confirm that the baseline file stays unchanged.
-3. Ask the agent to change a test and confirm that it asks for a QA file before handoff. Use synthetic QA data when testing a hosted model. Confirm the QA and readability notes are separate from Robocop. Decline the spreadsheet on another run and confirm that only QA is **Uncheckable**.
-4. If you use a separate reviewer model, confirm the disclosed recipient changes while the main Pi model does not.
+1. In a trusted project, ask Pi to show the validator settings. Check the Robocop baseline, QA folder, Python executable, and model recipient.
+2. Review one known mismatch using a synthetic QA workbook. Confirm the field and both source locations appear, with no workbook wording in the result.
+3. Change a mapped header and rerun. Confirm QA is **Uncheckable** while Robocop and advisory reviews continue.
+4. Review a changed resource with a comparable reference. Confirm reference notes are advisory and QA is **Not applicable**.
 
-For development, run `npm ci`, `npm run check`, and `npm test`. To include the stock Robocop integration test, set `ROBOCOP_9_4_PATH` to the absolute path of a Robocop 9.4.0 executable before running `npm test`.
+For development, run `npm ci`, `npm run check`, and `npm test`. Set `ROBOT_PARSER_PYTHON` to the absolute path to Python with Robot Framework 7.4.2 to include the live parser tests. Set `ROBOCOP_9_4_PATH` to the absolute path to Robocop 9.4.0 to include the stock lint integration tests.
