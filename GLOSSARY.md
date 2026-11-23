@@ -16,14 +16,26 @@ A plain-English convention the agent uses when reviewing a Robot test. It is not
 **Readability note**:
 An advisory observation about what a business reader cannot readily understand in a Robot test or where the test does not follow a review guideline. It is a judgment, not a rule violation.
 
+**Reference example**:
+An approved Robot Framework suite or resource used to compare a similar change. It is evidence for advisory review, not a lint rule.
+
+**Reference note**:
+An advisory observation that links changed Robot code or layout to a comparable reference example and explains why the comparison matters.
+
 **QA test case**:
 A record maintained by QA that identifies a test by its ID, name, and objective.
 
-**QA note**:
-An advisory observation about whether a Robot test's name and objective follow its QA record. It cites the test and the supporting spreadsheet location.
+**QA source**:
+The project spreadsheet that supplies the QA test cases for a check.
 
-**Uncheckable QA review**:
-A QA review without enough usable spreadsheet evidence to reach a conclusion for a test.
+**QA mapping**:
+A confirmed description of where the QA source holds the test case ID, name, and objective. A QA mapping describes the layout, not the file or its contents.
+
+**QA finding**:
+A confirmed discrepancy between a Robot test and its QA source. It comes from a deterministic check, not a reviewer judgment.
+
+**Uncheckable QA comparison**:
+A QA comparison that cannot reach a conclusion for a test or field because the Robot or QA evidence is missing, ambiguous, or unusable.
 
 **Global rule settings**:
 Rule settings that apply across projects.

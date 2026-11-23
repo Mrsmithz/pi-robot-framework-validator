@@ -1,0 +1,27 @@
+#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+
+if (process.argv[2] !== "check") {
+  process.stderr.write(`Unexpected Robocop command: ${process.argv.slice(2).join(" ")}\n`);
+  process.exit(2);
+}
+
+const output = process.argv.find((argument) => argument.startsWith("json_report.output_path="));
+if (!output) {
+  process.stderr.write("Missing JSON report output path.\n");
+  process.exit(2);
+}
+
+const files = process.argv.filter((argument) => argument.endsWith(".robot") || argument.endsWith(".resource"));
+const reportPath = output.slice("json_report.output_path=".length);
+fs.writeFileSync(reportPath, JSON.stringify(files.map((file) => ({
+  source: path.relative(process.cwd(), file),
+  line: 2,
+  rule_id: "FIXTURE001",
+  description: `Synthetic Robocop finding for ${path.relative(process.cwd(), file)}.`,
+}))));
+if (process.env.PI_FIXTURE_ROBOCOP_LOG) {
+  fs.appendFileSync(process.env.PI_FIXTURE_ROBOCOP_LOG, `${JSON.stringify(files.map((file) => path.relative(process.cwd(), file)))}\n`);
+}
+process.exit(files.length > 0 ? 1 : 0);

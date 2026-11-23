@@ -19,11 +19,27 @@ export type Settings = {
     model?: string;
     guidelines: Record<string, { text: string; enabled: boolean }>;
   };
+  qa: {
+    folder?: string;
+    python: string;
+  };
+  references: {
+    bitbucket: boolean;
+    local: Record<string, { path: string; category: string }>;
+    snippets: Record<string, {
+      workspace: string;
+      snippet: string;
+      revision: string;
+      file: string;
+      category: string;
+      projectPath?: string;
+    }>;
+  };
   sources: Record<string, string>;
 };
 
 export type SettingsIssue = {
-  section: "all" | "robocop" | "readability";
+  section: "all" | "robocop" | "readability" | "qa" | "references";
   path: string;
   key?: string;
   message: string;
@@ -130,8 +146,129 @@ function makeDefaults(projectRoot: string): Settings {
       enabled: true,
       guidelines,
     },
+    qa: { python: "python3" },
+    references: { bitbucket: false, local: {}, snippets: {} },
     sources,
   };
+}
+
+function isRelativeProjectPath(value: string): boolean {
+  if (value.length === 0 || value.trim() !== value || value.includes("\0") || /^[A-Za-z]:/.test(value) || isAbsolute(value) || win32.isAbsolute(value)) return false;
+  const normalized = value.replace(/\\/g, "/");
+  return normalized.split("/").every((part) => part !== "..");
+}
+
+function applyQa(value: unknown, path: string, scope: Scope, settings: Settings, errors: SettingsIssue[]): void {
+  if (scope !== "project") {
+    addIssue(errors, "qa", path, "qa", "QA settings can only be set in trusted project settings.");
+    return;
+  }
+  if (!isRecord(value)) {
+    addIssue(errors, "qa", path, "qa", "Expected a table.");
+    return;
+  }
+  for (const [key, setting] of Object.entries(value)) {
+    if (key === "folder") {
+      if (typeof setting !== "string" || !isRelativeProjectPath(setting)) {
+        addIssue(errors, "qa", path, "qa.folder", "Expected a non-empty relative project path.");
+        continue;
+      }
+      settings.qa.folder = setting;
+    } else if (key === "python") {
+      if (typeof setting !== "string" || !isValidCommand(setting)) {
+        addIssue(errors, "qa", path, "qa.python", "Expected one bare executable name or an absolute executable path, without arguments.");
+        continue;
+      }
+      settings.qa.python = setting;
+    } else {
+      addIssue(errors, "qa", path, `qa.${key}`, "Unknown QA setting.");
+    }
+  }
+}
+
+function applyReferences(value: unknown, path: string, scope: Scope, settings: Settings, errors: SettingsIssue[]): void {
+  if (scope !== "project") {
+    addIssue(errors, "references", path, "references", "Reference settings can only be set in trusted project settings.");
+    return;
+  }
+  if (!isRecord(value)) {
+    addIssue(errors, "references", path, "references", "Expected a table.");
+    return;
+  }
+  for (const [key, setting] of Object.entries(value)) {
+    if (key === "bitbucket") {
+      if (typeof setting !== "boolean") addIssue(errors, "references", path, "references.bitbucket", "Expected a boolean.");
+      else settings.references.bitbucket = setting;
+      continue;
+    }
+    if (key !== "local" && key !== "snippets") {
+      addIssue(errors, "references", path, `references.${key}`, "Unknown references setting.");
+      continue;
+    }
+    if (!isRecord(setting)) {
+      addIssue(errors, "references", path, `references.${key}`, "Expected a table of approved references.");
+      continue;
+    }
+    for (const [id, fields] of Object.entries(setting)) {
+      const keyPrefix = `references.${key}.${id}`;
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) {
+        addIssue(errors, "references", path, keyPrefix, "Reference IDs must use letters, numbers, dot, underscore, or hyphen.");
+        continue;
+      }
+      if (!isRecord(fields)) {
+        addIssue(errors, "references", path, keyPrefix, "Expected a reference table.");
+        continue;
+      }
+      const required = key === "local" ? ["path", "category"] : ["workspace", "snippet", "revision", "file", "category"];
+      const allowed = key === "local" ? [...required] : [...required, "projectPath"];
+      let valid = true;
+      for (const field of Object.keys(fields)) {
+        if (!allowed.includes(field)) {
+          addIssue(errors, "references", path, `${keyPrefix}.${field}`, "Unknown reference setting.");
+          valid = false;
+        }
+      }
+      for (const field of required) {
+        const fieldValue = fields[field];
+        if (typeof fieldValue !== "string" || fieldValue.trim().length === 0) {
+          addIssue(errors, "references", path, `${keyPrefix}.${field}`, "Expected a non-empty string.");
+          valid = false;
+        }
+      }
+      if (key === "local" && typeof fields.path === "string" && !isRelativeProjectPath(fields.path)) {
+        addIssue(errors, "references", path, `${keyPrefix}.path`, "Expected a relative project path.");
+        valid = false;
+      }
+      if (key === "snippets") {
+        if (typeof fields.revision === "string" && !/^[a-fA-F0-9]{40}$/.test(fields.revision)) {
+          addIssue(errors, "references", path, `${keyPrefix}.revision`, "Expected an immutable full 40-character Git SHA.");
+          valid = false;
+        }
+        if (fields.projectPath !== undefined && (typeof fields.projectPath !== "string" || !isRelativeProjectPath(fields.projectPath))) {
+          addIssue(errors, "references", path, `${keyPrefix}.projectPath`, "Expected a relative project path.");
+          valid = false;
+        }
+      }
+      if (!valid) continue;
+      if (key === "local") {
+        const localPath = fields.path;
+        const category = fields.category;
+        if (typeof localPath === "string" && typeof category === "string") {
+          setRecordValue(settings.references.local, id, { path: localPath, category });
+        }
+      } else {
+        const { workspace, snippet: snippetId, revision, file, category, projectPath } = fields;
+        if (typeof workspace === "string" && typeof snippetId === "string" &&
+            typeof revision === "string" && typeof file === "string" && typeof category === "string") {
+          const snippet: Settings["references"]["snippets"][string] = {
+            workspace, snippet: snippetId, revision, file, category,
+            ...(typeof projectPath === "string" ? { projectPath } : {}),
+          };
+          setRecordValue(settings.references.snippets, id, snippet);
+        }
+      }
+    }
+  }
 }
 
 function addIssue(
@@ -437,6 +574,14 @@ function applyDocument(
     }
     if (key === "readability") {
       applyReadability(value, path, settings, errors);
+      continue;
+    }
+    if (key === "qa") {
+      applyQa(value, path, scope, settings, errors);
+      continue;
+    }
+    if (key === "references") {
+      applyReferences(value, path, scope, settings, errors);
       continue;
     }
     addIssue(errors, "all", path, key, "Unknown settings section.");

@@ -2,19 +2,20 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { once } from "node:events";
-import { access, chmod, cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { test, type TestContext } from "node:test";
 
-const repoRoot = resolve(process.env.PI_ROBOT_VALIDATOR_ROOT ?? resolve(dirname(fileURLToPath(import.meta.url)), ".."));
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const piCli = resolve(repoRoot, "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
 const extension = resolve(repoRoot, "src/index.ts");
-const fixture = resolve(dirname(fileURLToPath(import.meta.url)), "fixtures/pi/trusted-project");
+const fixture = resolve(dirname(fileURLToPath(import.meta.url)), "fixtures/pi/changed-project");
 const CHAT_HISTORY_SENTINEL = "CHAT_HISTORY_SENTINEL_MUST_NOT_REACH_REVIEWER";
-const QA_SENTINEL = "SYNTHETIC_QA_DATA_SENTINEL";
-const GUIDELINE_SENTINEL = "SYNTHETIC_GUIDELINE_SENTINEL";
+const QA_SENTINEL = "QA_UNRELATED_SENTINEL";
+const UNRELATED_TEST_SENTINEL = "UNRELATED_TEST_SENTINEL";
+const REFERENCE_SENTINEL = "REFERENCE_SENTINEL";
 
 type JsonRecord = Record<string, unknown>;
 type Completion =
@@ -239,21 +240,177 @@ function responseDetails(event: JsonRecord): JsonRecord {
   return record(JSON.parse(rendered), "robot_review JSON result");
 }
 
-test("Pi runs trusted Robot review with local deterministic models", { timeout: 120_000 }, (t) => runPiReview(t, { shareQa: true, trusted: true }));
-test("Pi continues lint and readability without sending declined QA data", { timeout: 120_000 }, (t) => runPiReview(t, { shareQa: false, trusted: true }));
-test("Pi does not run Robocop when only the validator config is present in an unapproved project", { timeout: 120_000 },
-  (t) => runPiReview(t, { shareQa: true, trusted: false }));
+type Scenario = {
+  actions: Completion[];
+  prompt: string;
+  trusted?: boolean;
+  reviewerReply?: string;
+};
 
-async function runPiReview(t: TestContext, { shareQa, trusted }: { shareQa: boolean; trusted: boolean }) {
+test("Pi reports scoped lint, QA, readability, and references with approved local evidence", { timeout: 120_000 }, async (t) => {
+  const scenario: Scenario = {
+    actions: [
+      { kind: "tool", name: "robot_review", args: { action: "settings" } },
+      { kind: "tool", name: "robot_review", args: { action: "authorize-snippets", snippetIds: ["customer-api-pinned"] } },
+      { kind: "tool", name: "robot_review", args: { action: "map-qa", mapping: "default", layout: { headerRow: 1, id: "A", name: "B", objective: "C" } } },
+      { kind: "tool", name: "robot_review", args: {
+        action: "review",
+        changes: [{ path: "tests/example.robot", ranges: [{ startLine: 1, endLine: 5 }], category: "api" }],
+        qa: { mapping: "default" },
+        snippets: [{ id: "customer-api-pinned", workspace: "fixture-workspace", snippet: "fixture-snippet", revision: "0123456789abcdef0123456789abcdef01234567", file: "tests/pinned-reference.robot", startLine: 2, text: "REFERENCE_SENTINEL\n    No Operation\n" }],
+      } },
+    ],
+    prompt: "Review only the changed API test. Use the local QA mapping and the approved pinned reference excerpt. Report the current scope and each result section.",
+    reviewerReply: JSON.stringify({
+      readability: [{ file: "tests/example.robot", line: 2, message: "Synthetic readability note." }],
+      references: { status: "reviewed", notes: [{ type: "suggestion", source: { file: "tests/example.robot", line: 2 },
+        evidence: [{ id: "customer-api-pinned", line: 2 }], message: "Synthetic reference note." }] },
+    }),
+  };
+  const result = await runScenario(t, scenario);
+  if (!result) return;
+
+  const toolResults = getToolResults(result.pi);
+  assert.equal(toolResults.length, 4);
+  const review = responseDetails(toolResults.at(-1)!);
+  for (const section of ["scope", "robocop", "qa", "readability", "references", "settingsErrors"]) {
+    assert.ok(Object.hasOwn(review, section), `review result should include ${section}`);
+  }
+  const readability = record(review.readability, "readability result");
+  assert.equal(readability.status, "reviewed");
+  assert.equal(array(readability.notes, "readability notes").length, 1);
+  const references = record(review.references, "reference result");
+  assert.equal(references.status, "reviewed");
+  assert.match(JSON.stringify(references.notes), /customer-api-pinned/);
+  const scope = JSON.stringify(review.scope);
+  assert.match(scope, /tests\/example\.robot/);
+  assert.doesNotMatch(scope, /unrelated\.robot|mismatch\.robot/);
+  const qa = record(review.qa, "QA result");
+  assert.equal(qa.status, "checked");
+  const qaTests = array(qa.tests, "local QA test records").map((entry) => record(entry, "QA test record"));
+  assert.ok(qaTests.some((entry) => entry.file === "tests/example.robot"));
+  assert.ok(qaTests.every((entry) => !JSON.stringify(entry).includes(QA_SENTINEL)), "unrelated workbook rows must not become QA results");
+  assert.doesNotMatch(JSON.stringify(qa), /Unrelated payment edge/);
+  const matchedTest = qaTests.find((entry) => entry.file === "tests/example.robot")!;
+  assert.equal(record(matchedTest.id, "QA ID field").status, "match");
+  assert.equal(record(matchedTest.name, "QA name field").status, "match");
+  assert.equal(record(matchedTest.objective, "QA objective field").status, "match");
+  const lint = record(review.robocop, "Robocop result");
+  const findings = array(lint.findings, "Robocop findings").map((finding) => record(finding, "Robocop finding"));
+  assert.ok(findings.some((finding) => finding.file === "tests/example.robot"));
+  assert.ok(findings.every((finding) => finding.file !== "tests/unrelated.robot"));
+  assert.ok(result.robocopRuns.some((files) => files.includes("tests/example.robot")));
+  assert.ok(result.robocopRuns.every((files) => !files.includes("tests/unrelated.robot")));
+
+  const reviewerPayloads = result.captured.filter((body) => modelId(body) === "robot-reviewer").map((body) => JSON.stringify(body));
+  assert.ok(reviewerPayloads.some((payload) => payload.includes("LOCAL_REFERENCE_SENTINEL")), "configured local reference should reach the reviewer");
+  assert.ok(reviewerPayloads.some((payload) => payload.includes(REFERENCE_SENTINEL)), "the selected pinned excerpt should reach the reviewer");
+  assert.ok(reviewerPayloads.every((payload) => !payload.includes("UNAPPROVED_REFERENCE_SENTINEL")), "only the approved excerpt should reach the reviewer");
+  assert.ok(reviewerPayloads.every((payload) => !payload.includes(QA_SENTINEL)), "unrelated QA rows must stay local");
+  assert.ok(reviewerPayloads.every((payload) => !payload.includes(CHAT_HISTORY_SENTINEL)), "the advisory reviewer must not receive chat history");
+  assert.ok(reviewerPayloads.every((payload) => !payload.includes(UNRELATED_TEST_SENTINEL)), "unrelated Robot tests must stay out of review context");
+  assert.ok(result.uiRequests.some((request) => text(request.title).includes("pinned Bitbucket")), "native Pi UI should confirm pinned snippet consent");
+  assert.equal(responseDetails(toolResults[2]!).status, "saved", "Pi should persist the confirmed QA mapping");
+  const persistedMapping = await readFile(join(result.projectRoot, ".pi/robot-validator-qa-mappings.json"), "utf8");
+  assert.match(persistedMapping, /default/);
+  assert.match(persistedMapping, /headerRow/);
+});
+
+test("QA sentinel stays local for matched and unmatched changed tests", { timeout: 180_000 }, async (t) => {
+  for (const path of ["tests/example.robot", "tests/mismatch.robot"]) {
+    const result = await runScenario(t, {
+      actions: [
+        { kind: "tool", name: "robot_review", args: { action: "settings" } },
+        { kind: "tool", name: "robot_review", args: { action: "map-qa", mapping: "default", layout: { headerRow: 1, id: "A", name: "B", objective: "C" } } },
+        { kind: "tool", name: "robot_review", args: {
+          action: "review", changes: [{ path, ranges: [{ startLine: 1, endLine: 3 }] }], qa: { mapping: "default" },
+        } },
+      ],
+      prompt: `Review only ${path} and use the configured local QA mapping.`,
+      reviewerReply: JSON.stringify({ readability: [], references: { status: "reviewed", notes: [] } }),
+    });
+    if (!result) return;
+    assert.ok(!JSON.stringify(result.captured).includes(QA_SENTINEL), `unrelated QA record leaked for ${path}`);
+    const review = responseDetails(getToolResults(result.pi).at(-1)!);
+    const qa = record(review.qa, "QA result");
+    assert.equal(qa.status, "checked");
+    const qaTests = array(qa.tests, "local QA test records");
+    const matchedTest = record(qaTests.find((entry) => record(entry, "QA test record").file === path), "matched QA test");
+    assert.equal(record(matchedTest.id, "QA ID field").status, "match");
+    assert.equal(record(matchedTest.name, "QA name field").status, path.endsWith("mismatch.robot") ? "mismatch" : "match");
+    assert.equal(record(matchedTest.objective, "QA objective field").status, path.endsWith("mismatch.robot") ? "mismatch" : "match");
+    assert.doesNotMatch(JSON.stringify(qa), /Unrelated payment edge/);
+    const reviewerPayloads = result.captured.filter((body) => modelId(body) === "robot-reviewer");
+    assert.ok(reviewerPayloads.every((body) => !JSON.stringify(body).includes(QA_SENTINEL)));
+  }
+});
+
+test("resource-only changes skip workbook QA while empty changes skip all checks", { timeout: 180_000 }, async (t) => {
+  for (const changes of [
+    [{ path: "resources/shared.resource" }],
+    [],
+  ]) {
+    const result = await runScenario(t, {
+      actions: [
+        { kind: "tool", name: "robot_review", args: { action: "settings" } },
+        { kind: "tool", name: "robot_review", args: { action: "review", changes } },
+      ],
+      prompt: "Review the supplied changes only.",
+    });
+    if (!result) return;
+    const review = responseDetails(getToolResults(result.pi).at(-1)!);
+    const qa = record(review.qa, "QA result");
+    assert.equal(qa.status, "not-applicable");
+    assert.equal(qa.tests === undefined ? 0 : array(qa.tests, "local QA test records").length, 0, "empty or resource-only changes must not trigger QA comparisons");
+    assert.ok(!result.uiRequests.some((request) => request.method === "select"), "no QA workbook selection should be requested");
+    if (changes.length === 0) {
+      assert.equal(result.uiRequests.length, 0);
+      assert.equal(result.captured.filter((body) => modelId(body) === "robot-reviewer").length, 0);
+      assert.equal(result.robocopRuns.length, 0);
+    } else {
+      assert.ok(result.captured.some((body) => modelId(body) === "robot-reviewer"), "resource advisory should run");
+      assert.ok(result.robocopRuns.some((files) => files.includes("resources/shared.resource")), "Robocop should check changed resources");
+    }
+  }
+});
+
+test("untrusted projects cannot run lint or send QA and reference content", { timeout: 120_000 }, async (t) => {
+  const result = await runScenario(t, {
+    trusted: false,
+    actions: [
+      { kind: "tool", name: "robot_review", args: { action: "settings" } },
+      { kind: "tool", name: "robot_review", args: {
+        action: "review", changes: [{ path: "tests/example.robot", category: "api" }], qa: { mapping: "default" },
+      } },
+    ],
+    prompt: "Review only tests/example.robot.",
+  });
+  if (!result) return;
+  assert.equal(result.robocopRuns.length, 0);
+  assert.equal(result.captured.filter((body) => modelId(body) === "robot-reviewer").length, 0);
+  const allProviderRequests = JSON.stringify(result.captured);
+  assert.ok(!allProviderRequests.includes(QA_SENTINEL));
+  assert.ok(!allProviderRequests.includes(REFERENCE_SENTINEL));
+  const review = responseDetails(getToolResults(result.pi).at(-1)!);
+  const qa = record(review.qa, "QA result");
+  assert.notEqual(qa.status, "checked", "untrusted projects must not run local QA");
+  assert.equal(qa.tests === undefined ? 0 : array(qa.tests, "local QA test records").length, 0);
+});
+
+async function runScenario(t: TestContext, scenario: Scenario) {
+  const python = await findRobotPython();
+  if (!python) {
+    t.skip("Robot Framework 7.4.2 is unavailable; set ROBOT_PARSER_PYTHON to a Python environment that provides it.");
+    return undefined;
+  }
   const temporaryRoot = await mkdtemp(join(tmpdir(), "pi-robot-validator-e2e-"));
-  const projectRoot = join(temporaryRoot, "trusted-project");
+  const projectRoot = join(temporaryRoot, "changed-project");
   const agentDir = join(temporaryRoot, "pi-agent");
+  const robocopLog = join(temporaryRoot, "robocop-runs.jsonl");
   const captured: JsonRecord[] = [];
   const providerFailures: string[] = [];
   const uiRequests: JsonRecord[] = [];
-  const uiFailures: string[] = [];
   let mainRequests = 0;
-  let reviewerRequests = 0;
   let server: Server | undefined;
   let pi: RpcPi | undefined;
 
@@ -265,77 +422,27 @@ async function runPiReview(t: TestContext, { shareQa, trusted }: { shareQa: bool
 
   await cp(fixture, projectRoot, { recursive: true });
   await mkdir(agentDir, { recursive: true });
-  if (!trusted) {
+  if (scenario.trusted === false) {
     await cp(join(projectRoot, ".pi/robot-validator.toml"), join(agentDir, "robot-validator.toml"));
     await rm(join(projectRoot, ".pi/settings.json"));
     await writeFile(join(projectRoot, ".pi/robot-validator.toml"), '[robocop]\ncommand = "do-not-execute"\n');
   }
   const serverReady = createServer((request, response) => {
     void (async () => {
-      if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
-        throw new Error(`Unexpected local provider request: ${request.method} ${request.url}`);
-      }
+      if (request.method !== "POST" || request.url !== "/v1/chat/completions") throw new Error(`Unexpected local provider request: ${request.method} ${request.url}`);
       const body = await requestBody(request);
       captured.push(body);
       const model = modelId(body);
       let completion: Completion;
-
       if (model === "pi-agent") {
         mainRequests += 1;
-        if (mainRequests === 1) {
-          completion = { kind: "tool", name: "robot_review", args: { action: "settings" } };
-        } else if (mainRequests === 2) {
-          completion = {
-            kind: "tool",
-            name: "robot_review",
-            args: {
-              action: "review",
-              target: { kind: "project" },
-              qa: { path: "cases.csv", recipient: "local-e2e/robot-reviewer" },
-            },
-          };
-        } else if (mainRequests === 3) {
-          completion = { kind: "text", text: "Robocop findings, QA notes, and readability notes are reported separately." };
-        } else {
-          providerFailures.push(`Unexpected extra agent request ${mainRequests}.`);
-          completion = { kind: "text", text: "Unexpected extra request." };
-        }
+        completion = scenario.actions[mainRequests - 1] ?? { kind: "text", text: "Reviewed the current requested scope only." };
       } else if (model === "robot-reviewer") {
-        reviewerRequests += 1;
-        const requestText = text(body.messages);
-        const hasQa = requestText.includes(QA_SENTINEL);
-        const hasGuideline = requestText.includes(GUIDELINE_SENTINEL);
-        if (hasQa && !hasGuideline) {
-          completion = {
-            kind: "text",
-            text: JSON.stringify({
-              qa: {
-                status: "reviewed",
-                notes: [{ file: "tests/example.robot", line: 2, sheet: "CSV", cell: "B2", field: "name" }],
-              },
-            }),
-          };
-        } else if (hasGuideline && !hasQa) {
-          completion = {
-            kind: "text",
-            text: JSON.stringify({
-              readability: [{
-                file: "tests/example.robot",
-                line: 2,
-                guideline: "fixture-guideline",
-                message: "Synthetic readability note for the fixture test.",
-              }],
-            }),
-          };
-        } else {
-          providerFailures.push(`Reviewer request ${reviewerRequests} was not section-specific.`);
-          completion = { kind: "text", text: "{}" };
-        }
+        completion = { kind: "text", text: scenario.reviewerReply ?? JSON.stringify({ readability: [], references: { status: "reviewed", notes: [] } }) };
       } else {
         providerFailures.push(`Unexpected model requested: ${model}.`);
         completion = { kind: "text", text: "Unexpected model." };
       }
-
       sendCompletion(response, model, completion);
     })().catch((error: unknown) => {
       providerFailures.push(error instanceof Error ? error.message : String(error));
@@ -349,23 +456,17 @@ async function runPiReview(t: TestContext, { shareQa, trusted }: { shareQa: bool
   await listening;
   const address = serverReady.address();
   assert.ok(address && typeof address !== "string");
-  const providerUrl = `http://127.0.0.1:${address.port}/v1`;
 
   const models = {
     providers: {
       "local-e2e": {
         name: "Local deterministic E2E provider",
-        baseUrl: providerUrl,
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
         api: "openai-completions",
         apiKey: "e2e-dummy-key",
         authHeader: false,
         models: ["pi-agent", "robot-reviewer"].map((id) => ({
-          id,
-          name: id,
-          reasoning: false,
-          input: ["text"],
-          contextWindow: 16_000,
-          maxTokens: 2_048,
+          id, name: id, reasoning: false, input: ["text"], contextWindow: 16_000, maxTokens: 2_048,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         })),
       },
@@ -373,7 +474,6 @@ async function runPiReview(t: TestContext, { shareQa, trusted }: { shareQa: bool
   };
   await writeFile(join(agentDir, "models.json"), `${JSON.stringify(models, null, 2)}\n`);
   await chmod(join(projectRoot, "bin/robocop"), 0o755);
-
   await access(piCli);
   await access(extension);
 
@@ -382,23 +482,18 @@ async function runPiReview(t: TestContext, { shareQa, trusted }: { shareQa: bool
     HOME: temporaryRoot,
     PI_CODING_AGENT_DIR: agentDir,
     PI_OFFLINE: "1",
-    PATH: [join(projectRoot, "bin"), dirname(process.execPath), inheritedPath].filter(Boolean).join(delimiter),
+    PATH: [join(projectRoot, "bin"), dirname(process.execPath), dirname(python), inheritedPath].filter(Boolean).join(delimiter),
     TMPDIR: temporaryRoot,
     NO_COLOR: "1",
+    ROBOT_PARSER_PYTHON: python,
+    PI_FIXTURE_ROBOCOP_LOG: robocopLog,
   };
-  const child = spawn(process.execPath, [
-    piCli,
-    "--mode", "rpc",
-    "--no-session",
-    "--offline",
-    ...(trusted ? ["--approve"] : []),
-    "--no-context-files",
-    "--no-extensions",
-    "-e", extension,
-    "--tools", "robot_review",
-    "--model", "local-e2e/pi-agent",
-  ], { cwd: projectRoot, env, stdio: ["pipe", "pipe", "pipe"] });
+  const trusted = scenario.trusted !== false;
+  const child = spawn(process.execPath, [piCli, "--mode", "rpc", "--no-session", "--offline", ...(trusted ? ["--approve"] : ["--no-approve"]),
+    "--no-context-files", "--no-extensions", "-e", extension, "--tools", "robot_review", "--model", "local-e2e/pi-agent"],
+  { cwd: projectRoot, env, stdio: ["pipe", "pipe", "pipe"] });
   pi = new RpcPi(child);
+  const uiFailures: string[] = [];
   pi.onRecord((item) => {
     if (item.type !== "extension_ui_request") return;
     uiRequests.push(item);
@@ -406,97 +501,47 @@ async function runPiReview(t: TestContext, { shareQa, trusted }: { shareQa: bool
       uiFailures.push(`Unexpected extension UI request: ${JSON.stringify(item)}`);
       return;
     }
-    pi?.send({ type: "extension_ui_response", id: item.id, confirmed: item.title !== "Send selected QA data?" || shareQa });
+    pi?.send({ type: "extension_ui_response", id: item.id, confirmed: true });
   });
 
-  const availableModels = await pi.command("get_available_models");
-  const configured = array(record(availableModels.data, "available models response").models, "configured models");
-  assert.ok(configured.some((item) => record(item, "model").provider === "local-e2e" && record(item, "model").id === "pi-agent"));
-  assert.ok(configured.some((item) => record(item, "model").provider === "local-e2e" && record(item, "model").id === "robot-reviewer"));
-
+  const modelsResponse = await pi.command("get_available_models");
+  const configured = array(record(modelsResponse.data, "available models response").models, "configured models");
+  for (const id of ["pi-agent", "robot-reviewer"]) {
+    assert.ok(configured.some((item) => record(item, "model").provider === "local-e2e" && record(item, "model").id === id));
+  }
   const settled = pi.waitFor((item) => item.type === "agent_settled", "agent_settled");
-  await pi.command("prompt", {
-    message: `Review the entire sample project using the selected cases.csv. I authorize sending this synthetic QA data to local-e2e/robot-reviewer and confirm whole-project scope. Keep this chat-only value private: ${CHAT_HISTORY_SENTINEL}`,
-  });
+  await pi.command("prompt", { message: `${scenario.prompt} Keep this chat-only value private: ${CHAT_HISTORY_SENTINEL}` });
   await settled;
 
   assert.deepEqual(providerFailures, [], "local fake provider must handle every request");
-  assert.deepEqual(uiFailures, [], "Pi should request only supported consent confirmations");
-  assert.equal(mainRequests, 3, "the outer Pi model should perform settings, review, and final response turns");
-  assert.equal(reviewerRequests, shareQa ? 2 : 1, "Only approved review sections should reach the reviewer");
-  assert.deepEqual(
-    uiRequests.map((item) => item.title).sort(),
-    ["Review all Robot tests?", "Send selected QA data?"].sort(),
-    "RPC client must explicitly approve QA disclosure and whole-project scope",
-  );
+  assert.deepEqual(uiFailures, [], "Pi should request only supported confirmation dialogs");
+  assert.equal(mainRequests, scenario.actions.length + 1, "outer Pi model should complete each tool action and final response");
+  const rawLog = await readFile(robocopLog, "utf8").catch(() => "");
+  const robocopRuns = rawLog.split("\n").filter(Boolean).map(parseStringArray);
+  return { pi, projectRoot, captured, uiRequests, robocopRuns };
+}
 
-  const agentRequests = captured.filter((body) => modelId(body) === "pi-agent");
-  const nestedRequests = captured.filter((body) => modelId(body) === "robot-reviewer");
-  assert.equal(agentRequests.length, 3);
-  assert.ok(!JSON.stringify(agentRequests).includes(QA_SENTINEL), "spreadsheet cells must not be forwarded to the main agent");
-  assert.equal(nestedRequests.length, shareQa ? 2 : 1);
-  const firstAgent = agentRequests[0];
-  assert.ok(firstAgent);
-  const offeredTools = array(firstAgent.tools, "outer Pi tools");
-  const offeredNames = offeredTools.map((tool) => {
-    const entry = record(tool, "tool declaration");
-    const declaration = isRecord(entry.function) ? entry.function : entry;
-    return requiredString(declaration.name, "tool name");
-  });
-  assert.deepEqual(offeredNames, ["robot_review"], "the extension tool must be registered and active");
-  const firstMessages = array(firstAgent.messages, "first outer messages");
-  const systemMessage = record(firstMessages[0], "outer system message");
-  assert.equal(systemMessage.role, "system");
-  assert.match(text(systemMessage.content), /robot_validator_completion|If the task changes Robot Framework tests/);
-  assert.match(text(systemMessage.content), /robot_review/);
+function parseStringArray(line: string): string[] {
+  return array(JSON.parse(line), "Robocop invocation log").map((item) => requiredString(item, "Robocop file argument"));
+}
 
-  for (const nested of nestedRequests) {
-    assert.ok(nested.tools === undefined || (Array.isArray(nested.tools) && nested.tools.length === 0), "nested reviewer must receive no tools");
-    const messages = array(nested.messages, "nested reviewer messages");
-    assert.equal(messages.length, 2, "nested reviewer gets only its system prompt and one scoped user payload");
-    assert.equal(record(messages[0], "nested system message").role, "system");
-    assert.equal(record(messages[1], "nested user message").role, "user");
-    assert.ok(!JSON.stringify(nested).includes(CHAT_HISTORY_SENTINEL), "chat-only history must stay out of reviewer requests");
+function getToolResults(pi: RpcPi): JsonRecord[] {
+  return pi.records.filter((item) => item.type === "tool_execution_end" && item.toolName === "robot_review");
+}
+
+async function findRobotPython(): Promise<string | undefined> {
+  const candidates = [process.env.ROBOT_PARSER_PYTHON, "python3"].filter((value): value is string => Boolean(value));
+  for (const candidate of candidates) {
+    let output = "";
+    try {
+      const child = spawn(candidate, ["-m", "robot", "--version"], { stdio: ["ignore", "pipe", "ignore"] });
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => { output += chunk; });
+      await once(child, "close");
+      if (output.includes("Robot Framework 7.4.2")) return candidate;
+    } catch {
+      continue;
+    }
   }
-  const qaRequest = nestedRequests.find((body) => JSON.stringify(body).includes(QA_SENTINEL));
-  const readabilityRequest = nestedRequests.find((body) => JSON.stringify(body).includes(GUIDELINE_SENTINEL));
-  if (shareQa) {
-    assert.ok(qaRequest, "synthetic QA cells must reach the explicitly selected reviewer");
-    assert.ok(!JSON.stringify(qaRequest).includes(GUIDELINE_SENTINEL), "QA-only request must not include readability guidelines");
-  } else {
-    assert.ok(!JSON.stringify(captured).includes(QA_SENTINEL), "declined QA cells must not reach any model");
-  }
-  assert.ok(readabilityRequest, "configured readability guideline must reach the reviewer");
-  assert.ok(!JSON.stringify(readabilityRequest).includes(QA_SENTINEL), "readability-only request must not include QA data");
-
-  const executions = pi.records.filter((item) => item.type === "tool_execution_end" && item.toolName === "robot_review");
-  assert.equal(executions.length, 2, "Pi should expose settings and unified review tool results");
-  const settingsResult = responseDetails(executions[0]!);
-  assert.equal(settingsResult.trusted, trusted);
-  assert.equal(record(settingsResult.reviewer, "reviewer settings").recipient, "local-e2e/robot-reviewer");
-  const reviewResult = responseDetails(executions[1]!);
-  assert.equal(reviewResult.qaSource, shareQa ? "cases.csv" : undefined);
-  assert.deepEqual(Object.keys(reviewResult).filter((key) => ["robocop", "qa", "readability"].includes(key)).sort(), ["qa", "readability", "robocop"]);
-
-  const lint = record(reviewResult.robocop, "Robocop result");
-  if (trusted) {
-    assert.equal(lint.status, "completed");
-    const findings = array(lint.findings, "Robocop findings").map((finding) => record(finding, "Robocop finding"));
-    assert.ok(findings.some((finding) => finding.file === "tests/example.robot" && finding.message === "Synthetic Robocop fixture finding."), "Robocop finding must survive the unified review result");
-  } else {
-    assert.equal(lint.status, "uncheckable");
-    assert.match(requiredString(lint.reason, "lint reason"), /requires a trusted project/);
-  }
-
-  const qa = record(reviewResult.qa, "QA result");
-  if (shareQa) {
-    assert.equal(qa.status, "reviewed");
-    assert.ok(array(qa.notes, "QA notes").some((note) => record(note, "QA note").sheetIndex === 1), "QA output should retain its selected-sheet citation");
-  } else {
-    assert.equal(qa.status, "uncheckable");
-    assert.match(requiredString(qa.reason, "QA reason"), /not confirmed/);
-  }
-  const readability = record(reviewResult.readability, "readability result");
-  assert.equal(readability.status, "reviewed");
-  assert.ok(array(readability.notes, "readability notes").some((note) => record(note, "readability note").message === "Synthetic readability note for the fixture test."));
+  return undefined;
 }

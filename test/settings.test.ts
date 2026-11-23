@@ -30,6 +30,8 @@ test("returns defaults and their sources when no settings files exist", async (t
   assert.equal(result.settings.robocop.command, "robocop");
   assert.equal(result.settings.robocop.config, resolve(env.projectRoot, "robocop.toml"));
   assert.equal(result.settings.readability.enabled, true);
+  assert.deepEqual(result.settings.qa, { python: "python3" });
+  assert.deepEqual(result.settings.references, { bitbucket: false, local: {}, snippets: {} });
   assert.deepEqual(
     Object.fromEntries(
       Object.entries(result.settings.readability.guidelines).map(([id, guideline]) => [
@@ -213,7 +215,7 @@ spreadsheet = "tests.xlsx"
       ["readability", "readability.model"],
       ["readability", "readability.unknown"],
       ["readability", "readability.guidelines.named-verification.unknown"],
-      ["all", "qa"],
+      ["qa", "qa.spreadsheet"],
     ],
   );
   assert.ok(result.errors.every((issue) => issue.path === projectPath));
@@ -299,4 +301,80 @@ config = "\\u0000"
   assert.equal(result.errors.length, 1);
   assert.equal(result.errors[0]?.section, "robocop");
   assert.equal(result.errors[0]?.key, "robocop.config");
+});
+
+test("loads project-only QA and approved-reference settings and isolates their errors", async (t) => {
+  const env = await environment(t);
+  await writeFile(env.globalSettingsPath, `
+[qa]
+python = "global-python"
+
+[references]
+bitbucket = true
+`);
+  await writeFile(env.projectSettingsPath, `
+[qa]
+folder = "quality/cases"
+python = "/usr/bin/python3"
+
+[references]
+bitbucket = true
+
+[references.local.api-example]
+path = "tests/api.robot"
+category = "api"
+
+[references.snippets.shared-api]
+workspace = "team"
+snippet = "examples"
+revision = "0123456789abcdef0123456789abcdef01234567"
+file = "api.robot"
+category = "api"
+projectPath = "tests/api.robot"
+`);
+  const result = await loadSettings({ ...env, trusted: true });
+
+  assert.deepEqual(result.errors.map(({ section }) => section), ["qa", "references"]);
+  assert.deepEqual(result.settings.qa, { folder: "quality/cases", python: "/usr/bin/python3" });
+  assert.equal(result.settings.references.bitbucket, true);
+  assert.deepEqual(result.settings.references.local["api-example"], {
+    path: "tests/api.robot", category: "api",
+  });
+  assert.deepEqual(result.settings.references.snippets["shared-api"], {
+    workspace: "team", snippet: "examples",
+    revision: "0123456789abcdef0123456789abcdef01234567",
+    file: "api.robot", category: "api", projectPath: "tests/api.robot",
+  });
+});
+
+test("rejects global QA/reference settings and invalid local paths and snippet pins", async (t) => {
+  const env = await environment(t);
+  await writeFile(env.globalSettingsPath, `[qa]\npython = "python"\n[references]\nbitbucket = true\n`);
+  await writeFile(env.projectSettingsPath, `
+[qa]
+folder = "../outside"
+python = "python --version"
+
+[references]
+bitbucket = "yes"
+
+[references.local.bad]
+path = "../../outside.robot"
+category = "api"
+
+[references.snippets.bad]
+workspace = "team"
+snippet = "examples"
+revision = "main"
+file = "api.robot"
+category = "api"
+`);
+  const result = await loadSettings({ ...env, trusted: true });
+
+  assert.equal(result.settings.qa.python, "python3");
+  assert.equal(result.settings.references.bitbucket, false);
+  assert.deepEqual(result.settings.references.local, {});
+  assert.deepEqual(result.settings.references.snippets, {});
+  assert.deepEqual(result.errors.map(({ section }) => section), ["qa", "references", "qa", "qa", "references", "references", "references"]);
+  assert.ok(result.errors.every(({ section }) => section === "qa" || section === "references"));
 });
